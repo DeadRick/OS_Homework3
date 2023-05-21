@@ -22,6 +22,7 @@
 - 6 балла ✓
 - 7 балла ✓
 - 8 балла ✓
+- 9 баллов (смотреть последний скриншот)
 
 ## Сценарий задачи:
 
@@ -58,220 +59,357 @@
 ## Код сервера на языке С:
 
 ```C
-// Код сервера
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/ipc.h>
-#include <sys/sem.h>
-#include <sys/shm.h>
-#include <sys/types.h>
-#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <pthread.h>
 
-// Ключи для разделяемой памяти и семафора
-#define SHM_KEY 1234
-#define SEM_KEY 5678
+#define PORT 8080
 
-// Структура для хранения похищенного имущества
 typedef struct
 {
     int items;
     int value;
 } StolenGoods;
 
-// Функция для ожидания освобождения семафора
-void sem_wait(int sem_id)
+typedef struct
 {
-    struct sembuf sem_op = {0, -1, 0};
-    semop(sem_id, &sem_op, 1);
-}
+    int socket;
+    int isObserver;
+} ClientInfo;
 
-// Функция для освобождения семафора
-void sem_post(int sem_id)
+StolenGoods stolenGoods; // Объявление структуры StolenGoods
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; // Инициализация мьютекса
+int observerSocket = -1; // Сокет наблюдателя
+pthread_mutex_t observerMutex = PTHREAD_MUTEX_INITIALIZER; // Мьютекс для доступа к сокету наблюдателя
+
+void *clientHandler(void *arg)
 {
-    struct sembuf sem_op = {0, 1, 0};
-    semop(sem_id, &sem_op, 1);
+    ClientInfo client = *(ClientInfo *)arg;
+    char buffer[1024];
+
+    // Отправка разрешения доступа к общим ресурсам
+    send(client.socket, "Access granted", strlen("Access granted"), 0);
+
+    // Если клиент - наблюдатель, сохраняем его сокет
+    if (client.isObserver)
+    {
+        pthread_mutex_lock(&observerMutex);
+        observerSocket = client.socket;
+        printf("Сервер: наблюдатель подключен\n");
+
+        // Отправляем начальную стоимость склада
+        char valueStr[20];
+        snprintf(valueStr, sizeof(valueStr), "%d", stolenGoods.value);
+        send(observerSocket, valueStr, strlen(valueStr), 0);
+        pthread_mutex_unlock(&observerMutex);
+    }
+
+    // Главный цикл обработки клиента
+    while (1)
+    {
+        // Получение данных от клиента
+        int bytesReceived = recv(client.socket, buffer, 1024, 0);
+        if (bytesReceived <= 0)
+        {
+            // Проблема при получении данных или соединение закрыто
+            break;
+        }
+        buffer[bytesReceived] = '\0';
+
+        // Проверка условия завершения
+        if (stolenGoods.items <= 0 || stolenGoods.value <= 0)
+        {
+            printf("Сервер: все предметы похищены\n");
+            break;
+        }
+
+        // Обновление структуры с похищенным имуществом
+        int price = rand() % 41 + 10;
+        pthread_mutex_lock(&mutex);
+        stolenGoods.items--;
+        stolenGoods.value -= price;
+
+        printf("Сервер: со склада похитили товар стоимостью в %d$.\n", price);
+
+        // Преобразование стоимости в строку
+        char valueStr[20];
+        snprintf(valueStr, sizeof(valueStr), "%d", stolenGoods.value);
+
+        // Отправка стоимости клиенту
+        send(client.socket, valueStr, strlen(valueStr), 0);
+
+        // Отправка стоимости наблюдателю
+        if (client.isObserver)
+        {
+            pthread_mutex_lock(&observerMutex);
+            if (observerSocket != -1)
+            {
+                send(observerSocket, valueStr, strlen(valueStr), 0);
+            }
+            pthread_mutex_unlock(&observerMutex);
+        }
+
+        pthread_mutex_unlock(&mutex);
+
+        // Задержка перед следующей итерацией
+        sleep(1);
+    }
+
+    // Закрытие сокета клиента
+    close(client.socket);
+    pthread_exit(NULL);
 }
 
 int main()
 {
-    // Создание ключей для разделяемой памяти и семафора
-    int shm_id = shmget(SHM_KEY, sizeof(StolenGoods), IPC_CREAT | 0666);
-    if (shm_id == -1)
-    {
-        perror("Ошибка создания разделяемой памяти");
-        exit(EXIT_FAILURE);
-    }
-    int sem_id = semget(SEM_KEY, 1, IPC_CREAT | 0666); 
-    if (sem_id == -1)
-    {
-        perror("Ошибка создания/получения семафора");
-        exit(EXIT_FAILURE);
-    }
+    int serverSocket, newSocket;
+    struct sockaddr_in serverAddr, clientAddr;
+    socklen_t addrLen = sizeof(clientAddr);
+    char buffer[1024];
+    pthread_t threadId;
 
-    // Инициализация генератора случайных чисел
-    srand(time(NULL));
-
-    // Инициализация разделяемой памяти
-    StolenGoods *stolen_goods = (StolenGoods *)shmat(shm_id, NULL, 0);
-    if (stolen_goods == (void *)-1)
+    // Создание сокета
+    if ((serverSocket = socket(AF_INET, SOCK_STREAM, 0)) == 0)
     {
-        perror("Ошибка отображения разделяемой памяти");
+        perror("Ошибка создания сокета");
         exit(EXIT_FAILURE);
     }
 
-    stolen_goods->items = 0;
-    stolen_goods->value = 0;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(PORT);
 
-    // Инициализация семафора
-    semctl(sem_id, 0, SETVAL, 1);
+    // Привязка сокета к указанному порту
+    if (bind(serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
+    {
+        perror("Ошибка привязки сокета");
+        exit(EXIT_FAILURE);
+    }
+
+    // Ожидание подключения клиентов
+    if (listen(serverSocket, 5) < 0)
+    {
+        perror("Ошибка ожидания подключений");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Сервер: ожидание подключений...\n");
+
+    // Инициализация структуры с похищенным имуществом
+    stolenGoods.items = 100;  // Начальное количество предметов
+    stolenGoods.value = 1000; // Начальная стоимость
 
     // Главный цикл сервера
     while (1)
     {
-        // Ожидание запроса от клиента
-        sem_wait(sem_id);
-
-        // Обработка запроса
-        if (stolen_goods->items == 0) {
-            printf("Сервер: на складе тихо...\n");
-        }
-
-        // Освобождение доступа к общим ресурсам
-        sem_post(sem_id);
-        if (stolen_goods->items != 0)
+        // Принятие нового подключения от клиента
+        if ((newSocket = accept(serverSocket, (struct sockaddr *)&clientAddr, &addrLen)) < 0)
         {
-            printf("Сервер: у нас украли %d предметов со склада...\n", stolen_goods->items);
+            perror("Ошибка при принятии подключения");
+            exit(EXIT_FAILURE);
         }
+
+        printf("Сервер: новое подключение принято\n");
+
+        // Создание потока для обработки клиента
+        ClientInfo client;
+        client.socket = newSocket;
+
+        // Проверка, является ли клиент наблюдателем
+        
+        if (strstr(buffer, "2") != NULL)
+        {
+            client.isObserver = 1;
+        }
+        else
+        {
+            client.isObserver = 0;
+        }
+
+        if (pthread_create(&threadId, NULL, clientHandler, (void *)&client) != 0)
+        {
+            perror("Ошибка при создании потока");
+            exit(EXIT_FAILURE);
+        }
+
+        // Освобождение ресурсов потока
+        pthread_detach(threadId);
+
         // Проверка условия завершения
-        if (stolen_goods->items >= rand() % 41 + 10)
+        if (stolenGoods.items <= 0 || stolenGoods.value <= 0)
         {
-            break; // Завершение сервера
+            close(serverSocket);
+            break;
+        }
+    }
+
+    // Закрытие сокета сервера
+    close(serverSocket);
+
+    return 0;
+}
+
+```
+
+## Код клиента на языке C:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <arpa/inet.h>
+
+
+#define PORT 8080
+
+typedef struct {
+    int items;
+    int value;
+} StolenGoods;
+
+int main() {
+    int clientSocket;
+    struct sockaddr_in serverAddr;
+    char buffer[1024];
+
+    // Создание сокета
+    if ((clientSocket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Ошибка создания сокета");
+        exit(EXIT_FAILURE);
+    }
+
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+
+    // Преобразование IP-адреса из текстового вида в бинарный
+    if (inet_pton(AF_INET, "127.0.0.1", &(serverAddr.sin_addr)) <= 0) {
+        perror("Ошибка преобразования IP-адреса");
+        exit(EXIT_FAILURE);
+    }
+
+    // Подключение к серверу
+    if (connect(clientSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0) {
+        perror("Ошибка подключения");
+        exit(EXIT_FAILURE);
+    }
+
+    // Ожидание разрешения доступа к общим ресурсам от сервера
+    memset(buffer, 0, sizeof(buffer));
+    recv(clientSocket, buffer, 1024, 0);
+    printf("Клиент: разрешение доступа получено: %s\n", buffer);
+
+    // Главный цикл клиента
+    while (1) {
+        // Отправка данных на сервер
+        send(clientSocket, "Data from client", strlen("Data from client"), 0);
+
+        // Получение данных от сервера
+        memset(buffer, 0, sizeof(buffer));
+        int bytesGet = recv(clientSocket, buffer, 1024, 0);
+        
+        if (bytesGet == 0) {
+            printf("На складе украли всё, что можно.\n");
+            break;
+        }
+
+        printf("Клиент: вор украл со склада %s$\n", buffer);
+
+        // Проверка условия завершения
+        if (strcmp(buffer, "Сервер: все предметы похищены") == 0) {
+            printf("Клиент: все предметы похищены, завершение работы\n");
+            break;
         }
 
         // Задержка перед следующей итерацией
         sleep(1);
     }
     
-    printf("Тревога! У нас украли %d товаров со склада с общей стоимостью в %d$!!!", stolen_goods->items, stolen_goods->value);
-    // Отключение от разделяемой памяти
-    shmdt(stolen_goods);
-
-    // Удаление разделяемой памяти и семафора
-    shmctl(shm_id, IPC_RMID, NULL);
-    semctl(sem_id, 0, IPC_RMID);
+    printf
+    // Закрытие сокета клиента
+    close(clientSocket);
 
     return 0;
 }
 ```
 
-## Код клиента на языке C:
-```c
-// Код клиента
-
+## Код наблюдателя на языке C
+```C
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/ipc.h>
-#include <sys/sem.h>
-#include <sys/shm.h>
-#include <sys/types.h>
-#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <arpa/inet.h>
 
-// Ключи для разделяемой памяти и семафора
-#define SHM_KEY 1234
-#define SEM_KEY 5678
-
-// Структура для хранения похищенного имущества
-typedef struct
-{
-    int items;
-    int value;
-} StolenGoods;
-
-// Функция для ожидания освобождения семафора
-void sem_wait(int sem_id)
-{
-    struct sembuf sem_op = {0, -1, 0};
-    semop(sem_id, &sem_op, 1);
-}
-
-// Функция для освобождения семафора
-void sem_post(int sem_id)
-{
-    struct sembuf sem_op = {0, 1, 0};
-    semop(sem_id, &sem_op, 1);
-}
+#define PORT 8080
+#define BUFFER_SIZE 1024
 
 int main()
 {
-    // Получение ключа для разделяемой памяти
-    int shm_id = shmget(SHM_KEY, sizeof(StolenGoods), 0666);
-    if (shm_id == -1)
+    int socketId;
+    struct sockaddr_in serverAddr;
+    char buffer[BUFFER_SIZE];
+
+    // Создание сокета
+    if ((socketId = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
-        perror("Ошибка получения разделяемой памяти");
+        perror("Ошибка создания сокета");
         exit(EXIT_FAILURE);
     }
 
-    // Получение ключа для семафора
-    int sem_id = semget(SEM_KEY, 1, 0666);
-    if (sem_id == -1)
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+
+    // Преобразование IP-адреса из текстового в бинарный формат
+    if (inet_pton(AF_INET, "127.0.0.1", &(serverAddr.sin_addr)) <= 0)
     {
-        perror("Ошибка получения семафора");
+        perror("Ошибка преобразования адреса");
         exit(EXIT_FAILURE);
     }
 
-    // Инициализация генератора случайных чисел
-    srand(time(NULL));
-
-    // Подключение к разделяемой памяти
-    StolenGoods *stolen_goods = (StolenGoods *)shmat(shm_id, NULL, 0);
-    if (stolen_goods == (void *)-1)
+    // Подключение к серверу
+    if (connect(socketId, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
     {
-        perror("Ошибка отображения разделяемой памяти");
+        perror("Ошибка подключения");
         exit(EXIT_FAILURE);
     }
 
-    // Цикл действий клиента
+    // Отправка типа клиента (наблюдатель)
+    int clientType = 2;
+    send(socketId, &clientType, sizeof(clientType), 0);
+
+    printf("Наблюдатель: успешно подключен\n");
+
+    // Цикл получения информации от сервера
     while (1)
     {
-        // Запрос доступа к общим ресурсам
-        sem_wait(sem_id);
+        // Получение стоимости склада от сервера
+        int receivedBytes = recv(socketId, buffer, BUFFER_SIZE, 0);
+        if (receivedBytes <= 0)
+            break;
 
-        // Выполнение действий
-        if (stolen_goods->items == 0) {
-            printf("Клиент: выполняет действия...\n");
-        }
+        // Преобразование стоимости в число
+        int warehouseValue;
+        sscanf(buffer, "%d", &warehouseValue);
 
-        // Обновление данных и отправка их серверу
-        stolen_goods->items += 1;
-        stolen_goods->value += rand() % (10000 - 100 + 1) + 10000;
-        
-        printf("Клиент: Вор похитил %d предметов, общая стоимость %d\n", stolen_goods->items, stolen_goods->value);
-
-        // Освобождение доступа к общим ресурсам
-        sem_post(sem_id);
-
-        // Задержка перед следующей итерацией
-        sleep(1);
-
-        // Проверка условия завершения
-        if (stolen_goods->items >= rand() % 41 + 10)
-        {
-            printf("Вор сбежал.");
-            break; // Завершение клиента
-        }
+        // Вывод информации о стоимости склада
+        printf("Наблюдатель: текущая стоимость склада: %d$\n", warehouseValue);
     }
 
-    // Отключение от разделяемой памяти
-    shmdt(stolen_goods);
+    // Закрытие сокета
+    close(socketId);
 
     return 0;
 }
 
 ```
-
 
 ## Результаты программы (в прошлой ДЗ):
 ### Вставил код из прошлого домашнего задания для сравнения.
@@ -314,41 +452,12 @@ int main()
 
 ## Результат программ (текущий):
 ### Для удобного отображения покажу скриншот того, что получилось.
-![results](https://github.com/DeadRick/OS_Homework3/assets/39325834/4a9d779d-4f9f-4b9e-82aa-60a28017f89d)
-Как можно увидеть, к программе можно подключить несколько клиентов. Хотя я и делала изначально с низкой оценкой, но получилось так, что и на оценки повыше мне удалось выполнить программу. При этом, если посмотреть, то вор, который находится справа внизу экрана, подключился под конец кражи имущества со склада. 
+![image](https://github.com/DeadRick/OS_Homework3/assets/39325834/84316eaa-4d9f-4fcf-8cf9-8c51dd3a5afc)
+Как можно увидеть, к программе можно подключить клиента и наблюдателя. Хотя я и делала изначально с низкой оценкой, но получилось так, что и на оценки повыше мне удалось выполнить программу.  
 
 ### Второй запуск.
-![image](https://github.com/DeadRick/OS_Homework3/assets/39325834/59739a74-62fd-4f56-a446-9c0fa7aa6f57)
-Тут код был немного изменён. До этого, если склад завершал работу, то клиент получал доступ к общей памяти, тем самым продолжая воровать предметы. Сейчас же код работает так, что сервер указывает на то, что склад не пуст. Клиент ворует до того момента, пока сервера не скажет, что склад пуст, а затем завершит свою работу.
-
-Тем самым, была обновленна структура StolenGoods:
-```C
-typedef struct
-{
-    int items;
-    int value;
-    int isEmpty;
-} StolenGoods;
-```
-Сервер указывает, что склад пуст:
-```C
-// Код сервера
-        if (stolen_goods->items >= rand() % 41 + 10)
-        {
-            stolen_goods->isEmpty = -1;
-            break; // Завершение сервера
-        }
-```
-
-Клиент же проверяет остались ли предметы на складе:
-```c
-    // Проверка условия завершения
-        if (stolen_goods->isEmpty == -1)
-        {
-            printf("Клиент: Воровать больше нечего. Склад пуст. Вор сбежал... \n");
-            break; // Завершение клиента
-        }
-```
+![image](https://github.com/DeadRick/OS_Homework3/assets/39325834/cc2e8b18-407d-4fc7-8009-4a767dfe7a8d)
+При этом, можно подключать несколько клиентов, которые одновременно будут красть вещи со склада.
 
 Весь актуальный код можно найти в папке программы.
 
@@ -356,4 +465,5 @@ typedef struct
 
 На этом скриншоте можно увидеть, что клиент отключился и снова подключился. Это никак не сломало программу. Добавил ID для каждого клиента, чтобы было удобнее остледить их работу.
 Таким образом, программа была выполена на 8 баллов, ведь клиенты могут подлючаться и отключаться в любой момент (конечно, пока сервер еще существует).
-
+![image](https://github.com/DeadRick/OS_Homework3/assets/39325834/9395370c-8fa5-4c3d-9c73-253820a2d8c8)
+Вот демонстрация того, что клиенты могут отключаться и снова подключаться, при этом, продолжая делать все свои дела.
